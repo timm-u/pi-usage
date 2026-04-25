@@ -174,6 +174,7 @@ It builds the probe list from OpenCode's documented Go models, then adds any ext
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PI_USAGE_REFRESH_MIN` | `30` | Auto-refresh interval in minutes |
+| `PI_USAGE_AUTO_DISMISS_SEC` | `15` | Seconds before the widget auto-hides (0 = keep forever) |
 | `OPENCODE_API_KEY` | unset | OpenCode API key used for model availability probes |
 | `OPENCODE_GO_WORKSPACE_ID` | unset | Workspace id from the OpenCode Go dashboard URL |
 | `OPENCODE_GO_AUTH_COOKIE` | unset | Browser `auth` cookie value for `opencode.ai`, used for dashboard quota scraping |

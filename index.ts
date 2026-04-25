@@ -132,6 +132,7 @@ interface OpenCodeGoQuotaResult {
 const WIDGET_ID = "pi-usage";
 const CHECK_TIMEOUT_MS = 15_000;
 const AUTO_REFRESH_MINUTES = parseEnvInt("PI_USAGE_REFRESH_MIN", 30);
+const AUTO_DISMISS_MS = parseEnvInt("PI_USAGE_AUTO_DISMISS_SEC", 15) * 1000;
 const CODEX_REFRESH_SKEW_MS = 60_000;
 const CODEX_PROBE_MODEL = "gpt-5.4-mini";
 const OPENAI_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
@@ -1235,7 +1236,22 @@ export default function (pi: ExtensionAPI) {
 	let goUsage: OpenCodeGoUsage | undefined;
 	let isLoading = false;
 	let refreshTimer: ReturnType<typeof setInterval> | undefined;
+	let dismissTimer: ReturnType<typeof setTimeout> | undefined;
 	let currentCtx: any;
+
+	function dismissWidget(): void {
+		if (currentCtx?.hasUI) {
+			currentCtx.ui.setWidget(WIDGET_ID, undefined as any);
+		}
+		dismissTimer = undefined;
+	}
+
+	function scheduleDismiss(): void {
+		if (dismissTimer) clearTimeout(dismissTimer);
+		if (AUTO_DISMISS_MS > 0) {
+			dismissTimer = setTimeout(dismissWidget, AUTO_DISMISS_MS);
+		}
+	}
 
 	async function refreshUsage(ctx: any): Promise<void> {
 		if (isLoading) return;
@@ -1285,6 +1301,9 @@ export default function (pi: ExtensionAPI) {
 				buildUsageWidget(codexUsage, goUsage, theme, false),
 			);
 
+			// Auto-dismiss widget after timeout (0 = keep forever)
+			scheduleDismiss();
+
 			// Footer status
 			updateFooterStatus(ctx, codexUsage, goUsage);
 
@@ -1324,6 +1343,10 @@ export default function (pi: ExtensionAPI) {
 		if (refreshTimer) {
 			clearInterval(refreshTimer);
 			refreshTimer = undefined;
+		}
+		if (dismissTimer) {
+			clearTimeout(dismissTimer);
+			dismissTimer = undefined;
 		}
 	});
 
