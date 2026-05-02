@@ -714,16 +714,21 @@ function buildUsageWidget(
 			if (window.used === undefined) continue;
 			const windowColor = usageColor(window.used);
 			const windowBar = progressBar(window.used);
-			const reset = window.resetAt
-				? ` resets ${formatResetTime(window.resetAt)}`
+			const resetStr = window.resetAt
+				? ` (resets ${formatResetTime(window.resetAt)})`
 				: window.resetAfterSeconds !== undefined
-					? ` resets in ${formatDuration(window.resetAfterSeconds)}`
+					? ` (resets in ${formatDuration(window.resetAfterSeconds)})`
 					: "";
-			const remaining = window.remaining !== undefined
-				? ` / ${window.remaining.toFixed(0)}% left`
+
+			// Pacing: ideal usage if evenly distributed through the period
+			const paceTotalDays = window.label === "week" ? 7 : window.label === "month" ? 30 : 0;
+			const remainingSec = window.resetAfterSeconds ?? (window.resetAt ? Math.max(0, window.resetAt - Date.now() / 1000) : 0);
+			const paceStr = (paceTotalDays > 0 && remainingSec > 0)
+				? ` / ${((Math.max(0, paceTotalDays - remainingSec / 86400) / paceTotalDays) * 100).toFixed(0)}% paced`
 				: "";
+
 			lines.push(
-				`  ${window.label.padEnd(7)} ${theme.fg(windowColor, windowBar)} ${theme.fg(windowColor, `${window.used.toFixed(0)}% used`)}${theme.fg("dim", remaining + reset)}`,
+				`  ${window.label.padEnd(7)} ${theme.fg(windowColor, windowBar)} ${theme.fg(windowColor, `${window.used.toFixed(0)}% used`)}${theme.fg("dim", paceStr + resetStr)}`,
 			);
 		}
 		if (go.quotaError) {
