@@ -1,7 +1,7 @@
 {
   "name": "pi-usage",
   "version": "0.1.0",
-  "description": "Usage limit checker for pi coding agent — shows Codex and OpenCode Go limits at startup",
+  "description": "Usage limit checker for pi coding agent — shows OpenCode Go limits at startup",
   "license": "MIT",
   "type": "module",
   "main": "index.ts",
@@ -19,7 +19,6 @@
     "pi-extension",
     "usage",
     "rate-limits",
-    "codex",
     "opencode",
     "opencode-go",
     "monitoring"

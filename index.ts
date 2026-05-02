@@ -1,13 +1,12 @@
 /**
  * pi-usage — Usage limit checker for pi coding agent
  *
- * Checks Codex (5hr & weekly) and OpenCode Go usage limits at startup
- * and displays a clean summary widget above the editor.
+ * Checks OpenCode Go usage limits at startup and displays a clean summary
+ * widget above the editor.
  *
  * Also provides `/usage` command to refresh on demand.
  *
  * Setup:
- *   Codex:        Uses OAuth token from pi's auth.json (same as openai-codex provider)
  *   OpenCode Go:  Uses OPENCODE_API_KEY for model probes, plus optional
  *                 OPENCODE_GO_WORKSPACE_ID + OPENCODE_GO_AUTH_COOKIE for quota
  */
@@ -17,34 +16,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { execSync } from "node:child_process";
 import { getModels } from "@mariozechner/pi-ai";
-import { refreshOpenAICodexToken } from "@mariozechner/pi-ai/oauth";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 
 // ───────── Types ─────────
-
-interface CodexUsage {
-	planType: string;
-	activeLimit: string;
-	primaryUsedPercent: number;      // 5hr window
-	secondaryUsedPercent: number;    // weekly window
-	codeReviewUsedPercent?: number;
-	primaryWindowMinutes: number;
-	secondaryWindowMinutes: number;
-	codeReviewWindowMinutes?: number;
-	primaryResetAfterSeconds: number;
-	secondaryResetAfterSeconds: number;
-	codeReviewResetAfterSeconds?: number;
-	primaryResetAt: number;          // unix timestamp seconds
-	secondaryResetAt: number;
-	codeReviewResetAt?: number;
-	primaryOverSecondaryLimitPercent: number;
-	creditsHasCredits: boolean;
-	creditsBalance: string;
-	creditsUnlimited: boolean;
-	source?: "usage_api" | "probe";
-	error?: string;
-}
 
 type GoModelStatus = "available" | "rate_limited" | "credits_error" | "error" | "no_key";
 type GoProbeApi = "openai-completions" | "anthropic-messages";
@@ -54,16 +29,7 @@ interface AuthApiKeyCredential {
 	key?: string;
 }
 
-interface CodexOAuthCredential {
-	type?: "oauth";
-	access?: string;
-	refresh?: string;
-	expires?: number;
-	accountId?: string;
-}
-
-type AuthJson = Record<string, AuthApiKeyCredential | CodexOAuthCredential | undefined>;
-type OpenAIOAuthSourceKey = (typeof OPENAI_OAUTH_SOURCE_KEYS)[number];
+type AuthJson = Record<string, AuthApiKeyCredential | undefined>;
 
 interface GoCheckModel {
 	id: string;
@@ -133,12 +99,8 @@ const WIDGET_ID = "pi-usage";
 const CHECK_TIMEOUT_MS = 15_000;
 const AUTO_REFRESH_MINUTES = parseEnvInt("PI_USAGE_REFRESH_MIN", 30);
 const AUTO_DISMISS_MS = parseEnvInt("PI_USAGE_AUTO_DISMISS_SEC", 15) * 1000;
-const CODEX_REFRESH_SKEW_MS = 60_000;
-const CODEX_PROBE_MODEL = "gpt-5.4-mini";
-const OPENAI_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
 const OPENCODE_GO_QUOTA_CONFIG_FILE = path.join("opencode-quota", "opencode-go.json");
 const OPENCODE_GO_DASHBOARD_URL_PREFIX = "https://opencode.ai/workspace";
-const OPENAI_OAUTH_SOURCE_KEYS = ["openai-codex", "openai", "codex", "chatgpt", "opencode"] as const;
 
 // OpenCode Go publishes a fixed dollar limit, but no public usage/balance API.
 // These are used only as the probe fallback when the installed pi model registry
@@ -251,23 +213,19 @@ function getOpenCodeGoQuotaConfig(): OpenCodeGoQuotaConfigState {
 	return {};
 }
 
-function writeAuthJson(auth: AuthJson): void {
-	const authPath = authJsonPath();
-	fs.writeFileSync(authPath, JSON.stringify(auth, null, 2), "utf8");
-	try {
-		fs.chmodSync(authPath, 0o600);
-	} catch { /* best effort on platforms without POSIX permissions */ }
+function getOpenCodeApiKey(): string | undefined {
+	const auth = readAuthJson();
+	const goKey = getAuthApiKey(auth, "opencode-go");
+	if (goKey) return goKey;
+	const zenKey = getAuthApiKey(auth, "opencode");
+	if (zenKey) return zenKey;
+	return process.env.OPENCODE_API_KEY;
 }
 
-function extractAccountId(token: string): string | undefined {
-	try {
-		const parts = token.split(".");
-		if (parts.length !== 3) return undefined;
-		const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
-		return payload?.["https://api.openai.com/auth"]?.chatgpt_account_id;
-	} catch {
-		return undefined;
-	}
+function getAuthApiKey(auth: AuthJson | undefined, provider: string): string | undefined {
+	const credential = auth?.[provider] as AuthApiKeyCredential | undefined;
+	if (credential?.type !== "api_key" || !credential.key) return undefined;
+	return resolveConfigValue(credential.key);
 }
 
 function resolveConfigValue(config: string): string | undefined {
@@ -283,57 +241,6 @@ function resolveConfigValue(config: string): string | undefined {
 		}
 	}
 	return process.env[config] || config;
-}
-
-async function getCodexToken(): Promise<{ token: string; accountId: string; sourceKey: OpenAIOAuthSourceKey } | undefined> {
-	try {
-		const auth = readAuthJson();
-		if (!auth) return undefined;
-
-		let sourceKey: OpenAIOAuthSourceKey | undefined;
-		let codex: CodexOAuthCredential | undefined;
-		for (const key of OPENAI_OAUTH_SOURCE_KEYS) {
-			const candidate = auth[key] as CodexOAuthCredential | undefined;
-			if (candidate?.type === "oauth" && candidate.access) {
-				sourceKey = key;
-				codex = candidate;
-				break;
-			}
-		}
-		if (!sourceKey || !codex?.access) return undefined;
-
-		if (codex.refresh && (!codex.expires || Date.now() + CODEX_REFRESH_SKEW_MS >= codex.expires)) {
-			const refreshed = await refreshOpenAICodexToken(codex.refresh);
-			const accountId = typeof refreshed.accountId === "string"
-				? refreshed.accountId
-				: extractAccountId(refreshed.access);
-			if (!accountId) return undefined;
-			auth[sourceKey] = { type: "oauth", ...refreshed, accountId };
-			writeAuthJson(auth);
-			return { token: refreshed.access, accountId, sourceKey };
-		}
-
-		const accountId = codex.accountId ?? extractAccountId(codex.access);
-		if (!accountId) return undefined;
-		return { token: codex.access, accountId, sourceKey };
-	} catch {
-		return undefined;
-	}
-}
-
-function getOpenCodeApiKey(): string | undefined {
-	const auth = readAuthJson();
-	const goKey = getAuthApiKey(auth, "opencode-go");
-	if (goKey) return goKey;
-	const zenKey = getAuthApiKey(auth, "opencode");
-	if (zenKey) return zenKey;
-	return process.env.OPENCODE_API_KEY;
-}
-
-function getAuthApiKey(auth: AuthJson | undefined, provider: string): string | undefined {
-	const credential = auth?.[provider] as AuthApiKeyCredential | undefined;
-	if (credential?.type !== "api_key" || !credential.key) return undefined;
-	return resolveConfigValue(credential.key);
 }
 
 function formatDuration(seconds: number): string {
@@ -362,16 +269,6 @@ function usageColor(percent: number): string {
 	return "success";
 }
 
-function parseHeaderNumber(value: string | undefined, fallback: number): number {
-	if (value === undefined) return fallback;
-	const parsed = Number(value);
-	return Number.isFinite(parsed) ? parsed : fallback;
-}
-
-function parseHeaderBool(value: string | undefined): boolean {
-	return value?.toLowerCase() === "true";
-}
-
 function statusIcon(status: GoModelStatus): string {
 	switch (status) {
 		case "available": return "✓";
@@ -380,281 +277,6 @@ function statusIcon(status: GoModelStatus): string {
 		case "error": return "⚠";
 		case "no_key": return "—";
 	}
-}
-
-interface OpenAIUsageWindow {
-	used_percent?: number;
-	limit_window_seconds?: number;
-	reset_after_seconds?: number;
-	reset_at?: number;
-}
-
-interface OpenAIUsageResponse {
-	plan_type?: string;
-	rate_limit?: {
-		limit_reached?: boolean;
-		primary_window?: OpenAIUsageWindow | null;
-		secondary_window?: OpenAIUsageWindow | null;
-	} | null;
-	code_review_rate_limit?: {
-		primary_window?: OpenAIUsageWindow | null;
-	} | null;
-	credits?: {
-		has_credits?: boolean;
-		unlimited?: boolean;
-		balance?: string | null;
-	} | null;
-}
-
-type CodexUsageApiResult =
-	| { success: true; usage: CodexUsage }
-	| { success: false; error: string };
-
-function windowUsedPercent(window: OpenAIUsageWindow | null | undefined): number {
-	return clampPercent(Number(window?.used_percent ?? 0));
-}
-
-function windowMinutes(window: OpenAIUsageWindow | null | undefined, fallback: number): number {
-	const seconds = Number(window?.limit_window_seconds);
-	return Number.isFinite(seconds) && seconds > 0 ? seconds / 60 : fallback;
-}
-
-function windowResetAfterSeconds(window: OpenAIUsageWindow | null | undefined): number {
-	const seconds = Number(window?.reset_after_seconds);
-	return Number.isFinite(seconds) && seconds > 0 ? Math.round(seconds) : 0;
-}
-
-function windowResetAt(window: OpenAIUsageWindow | null | undefined): number {
-	const resetAt = Number(window?.reset_at);
-	if (Number.isFinite(resetAt) && resetAt > 0) return Math.round(resetAt);
-	const resetAfter = windowResetAfterSeconds(window);
-	return resetAfter > 0 ? Math.round(Date.now() / 1000) + resetAfter : 0;
-}
-
-// ───────── Codex Usage Check ─────────
-
-async function checkCodexUsageFromUsageApi(token: string, accountId: string): Promise<CodexUsageApiResult> {
-	try {
-		const controller = new AbortController();
-		const timeout = setTimeout(() => controller.abort(), CHECK_TIMEOUT_MS);
-
-		let response: Response;
-		try {
-			response = await fetch(OPENAI_USAGE_URL, {
-				headers: {
-					"Authorization": `Bearer ${token}`,
-					"ChatGPT-Account-Id": accountId,
-					"User-Agent": `pi-usage (${os.platform()} ${os.release()}; ${os.arch()})`,
-				},
-				signal: controller.signal,
-			});
-		} finally {
-			clearTimeout(timeout);
-		}
-
-		if (!response.ok) {
-			let detail = `HTTP ${response.status}`;
-			try {
-				const body = await response.text();
-				detail = body.substring(0, 160) || detail;
-			} catch { /* ignore */ }
-			return { success: false, error: `OpenAI usage API: ${detail}` };
-		}
-
-		const data = (await response.json()) as OpenAIUsageResponse;
-		const primary = data.rate_limit?.primary_window;
-		if (!primary) {
-			return { success: false, error: "OpenAI usage API: no primary quota window" };
-		}
-
-		const secondary = data.rate_limit?.secondary_window;
-		const codeReview = data.code_review_rate_limit?.primary_window;
-		const usage: CodexUsage = {
-			planType: data.plan_type ?? "unknown",
-			activeLimit: data.rate_limit?.limit_reached ? "rate_limited" : "normal",
-			primaryUsedPercent: windowUsedPercent(primary),
-			secondaryUsedPercent: windowUsedPercent(secondary),
-			codeReviewUsedPercent: codeReview ? windowUsedPercent(codeReview) : undefined,
-			primaryWindowMinutes: windowMinutes(primary, 300),
-			secondaryWindowMinutes: windowMinutes(secondary, 10080),
-			codeReviewWindowMinutes: codeReview ? windowMinutes(codeReview, 0) : undefined,
-			primaryResetAfterSeconds: windowResetAfterSeconds(primary),
-			secondaryResetAfterSeconds: windowResetAfterSeconds(secondary),
-			codeReviewResetAfterSeconds: codeReview ? windowResetAfterSeconds(codeReview) : undefined,
-			primaryResetAt: windowResetAt(primary),
-			secondaryResetAt: windowResetAt(secondary),
-			codeReviewResetAt: codeReview ? windowResetAt(codeReview) : undefined,
-			primaryOverSecondaryLimitPercent: 0,
-			creditsHasCredits: Boolean(data.credits?.has_credits),
-			creditsBalance: data.credits?.balance ?? "",
-			creditsUnlimited: Boolean(data.credits?.unlimited),
-			source: "usage_api",
-		};
-		return { success: true, usage };
-	} catch (e: unknown) {
-		return {
-			success: false,
-			error: e instanceof Error ? e.message : String(e),
-		};
-	}
-}
-
-async function checkCodexUsageWithProbe(token: string, accountId: string): Promise<CodexUsage> {
-	const baseUrl = "https://chatgpt.com/backend-api/codex/responses";
-
-	try {
-		const controller = new AbortController();
-		const timeout = setTimeout(() => controller.abort(), CHECK_TIMEOUT_MS);
-
-		const response = await fetch(baseUrl, {
-			method: "POST",
-			headers: {
-				"Authorization": `Bearer ${token}`,
-				"chatgpt-account-id": accountId,
-				"Content-Type": "application/json",
-				"OpenAI-Beta": "responses=experimental",
-				"accept": "text/event-stream",
-				"originator": "pi-usage",
-				"User-Agent": `pi-usage (${os.platform()} ${os.release()}; ${os.arch()})`,
-			},
-			body: JSON.stringify({
-				model: CODEX_PROBE_MODEL,
-				instructions: "Reply with just: ok",
-				input: [{ type: "message", role: "user", content: "hi" }],
-				store: false,
-				stream: true,
-			}),
-			signal: controller.signal,
-		});
-
-		clearTimeout(timeout);
-
-		const getHeader = (name: string): string | undefined =>
-			response.headers.get(name) ?? undefined;
-
-		if (response.ok) {
-			// Consume the body to complete the stream
-			try {
-				const reader = response.body?.getReader();
-				if (reader) {
-					while (true) {
-						const { done } = await reader.read();
-						if (done) break;
-					}
-					reader.releaseLock();
-				}
-			} catch { /* stream already ended or aborted */ }
-
-			return {
-				planType: getHeader("x-codex-plan-type") ?? "unknown",
-				activeLimit: getHeader("x-codex-active-limit") ?? "unknown",
-				primaryUsedPercent: parseHeaderNumber(getHeader("x-codex-primary-used-percent"), 0),
-				secondaryUsedPercent: parseHeaderNumber(getHeader("x-codex-secondary-used-percent"), 0),
-				primaryWindowMinutes: parseHeaderNumber(getHeader("x-codex-primary-window-minutes"), 300),
-				secondaryWindowMinutes: parseHeaderNumber(getHeader("x-codex-secondary-window-minutes"), 10080),
-				primaryResetAfterSeconds: parseHeaderNumber(getHeader("x-codex-primary-reset-after-seconds"), 0),
-				secondaryResetAfterSeconds: parseHeaderNumber(getHeader("x-codex-secondary-reset-after-seconds"), 0),
-				primaryResetAt: parseHeaderNumber(getHeader("x-codex-primary-reset-at"), 0),
-				secondaryResetAt: parseHeaderNumber(getHeader("x-codex-secondary-reset-at"), 0),
-				primaryOverSecondaryLimitPercent: parseHeaderNumber(getHeader("x-codex-primary-over-secondary-limit-percent"), 0),
-				creditsHasCredits: parseHeaderBool(getHeader("x-codex-credits-has-credits")),
-				creditsBalance: getHeader("x-codex-credits-balance") ?? "",
-				creditsUnlimited: parseHeaderBool(getHeader("x-codex-credits-unlimited")),
-				source: "probe",
-			};
-		}
-
-		// 429 = rate limited
-		if (response.status === 429) {
-			let resetAt = parseHeaderNumber(getHeader("x-codex-primary-reset-at"), 0);
-			try {
-				const body = await response.text();
-				const parsed = JSON.parse(body);
-				resetAt = parsed?.error?.resets_at ?? resetAt;
-			} catch { /* ignore */ }
-
-			return {
-				planType: getHeader("x-codex-plan-type") ?? "unknown",
-				activeLimit: getHeader("x-codex-active-limit") ?? "rate_limited",
-				primaryUsedPercent: parseHeaderNumber(getHeader("x-codex-primary-used-percent"), 100),
-				secondaryUsedPercent: parseHeaderNumber(getHeader("x-codex-secondary-used-percent"), 100),
-				primaryWindowMinutes: parseHeaderNumber(getHeader("x-codex-primary-window-minutes"), 300),
-				secondaryWindowMinutes: parseHeaderNumber(getHeader("x-codex-secondary-window-minutes"), 10080),
-				primaryResetAfterSeconds: parseHeaderNumber(
-					getHeader("x-codex-primary-reset-after-seconds"),
-					resetAt ? Math.max(0, Math.round(resetAt - Date.now() / 1000)) : 0,
-				),
-				secondaryResetAfterSeconds: parseHeaderNumber(getHeader("x-codex-secondary-reset-after-seconds"), 0),
-				primaryResetAt: resetAt,
-				secondaryResetAt: parseHeaderNumber(getHeader("x-codex-secondary-reset-at"), 0),
-				primaryOverSecondaryLimitPercent: parseHeaderNumber(getHeader("x-codex-primary-over-secondary-limit-percent"), 0),
-				creditsHasCredits: parseHeaderBool(getHeader("x-codex-credits-has-credits")),
-				creditsBalance: getHeader("x-codex-credits-balance") ?? "",
-				creditsUnlimited: parseHeaderBool(getHeader("x-codex-credits-unlimited")),
-				source: "probe",
-				error: "Rate limited (429)",
-			};
-		}
-
-		// Other errors
-		let errorMsg = `HTTP ${response.status}`;
-		try {
-			const body = await response.text();
-			const parsed = JSON.parse(body);
-			errorMsg = parsed?.error?.message ?? parsed?.detail ?? errorMsg;
-		} catch { /* ignore */ }
-
-		return {
-			planType: "unknown",
-			activeLimit: "error",
-			primaryUsedPercent: 0,
-			secondaryUsedPercent: 0,
-			primaryWindowMinutes: 300,
-			secondaryWindowMinutes: 10080,
-			primaryResetAfterSeconds: 0,
-			secondaryResetAfterSeconds: 0,
-			primaryResetAt: 0,
-			secondaryResetAt: 0,
-			primaryOverSecondaryLimitPercent: 0,
-			creditsHasCredits: false,
-			creditsBalance: "",
-			creditsUnlimited: false,
-			source: "probe",
-			error: errorMsg,
-		};
-	} catch (e: unknown) {
-		return {
-			planType: "unknown",
-			activeLimit: "error",
-			primaryUsedPercent: 0,
-			secondaryUsedPercent: 0,
-			primaryWindowMinutes: 300,
-			secondaryWindowMinutes: 10080,
-			primaryResetAfterSeconds: 0,
-			secondaryResetAfterSeconds: 0,
-			primaryResetAt: 0,
-			secondaryResetAt: 0,
-			primaryOverSecondaryLimitPercent: 0,
-			creditsHasCredits: false,
-			creditsBalance: "",
-			creditsUnlimited: false,
-			source: "probe",
-			error: e instanceof Error ? e.message : String(e),
-		};
-	}
-}
-
-async function checkCodexUsage(token: string, accountId: string): Promise<CodexUsage> {
-	const usageApiResult = await checkCodexUsageFromUsageApi(token, accountId);
-	if (usageApiResult.success) {
-		return usageApiResult.usage;
-	}
-
-	const probeResult = await checkCodexUsageWithProbe(token, accountId);
-	if (probeResult.error && probeResult.activeLimit === "error") {
-		probeResult.error = `${usageApiResult.error}; fallback probe: ${probeResult.error}`;
-	}
-	return probeResult;
 }
 
 // ───────── OpenCode Go Usage Check ─────────
@@ -1031,7 +653,6 @@ async function checkOpenCodeGoUsage(
 // ───────── Widget Rendering ─────────
 
 function buildUsageWidget(
-	codex: CodexUsage | undefined,
 	go: OpenCodeGoUsage | undefined,
 	theme: any,
 	loading: boolean,
@@ -1045,73 +666,6 @@ function buildUsageWidget(
 
 	// Header
 	lines.push(theme.bold(theme.fg("accent", "⚡ Usage Limits")));
-
-	// ── Codex ──
-	if (codex) {
-		if (codex.error && codex.activeLimit === "error") {
-			lines.push(theme.fg("dim", sep.repeat(40)));
-			lines.push(`${theme.fg("error", "✗ Codex")} ${theme.fg("dim", "— " + codex.error)}`);
-		} else {
-			const planLabel = codex.planType !== "unknown" ? ` (${codex.planType})` : "";
-			const limitLabel = codex.activeLimit !== "unknown" && codex.activeLimit !== "normal"
-				? ` [${codex.activeLimit}]`
-				: "";
-
-			// 5hr window
-			const p5 = codex.primaryUsedPercent;
-			const p5Color = usageColor(p5);
-			const p5Bar = progressBar(p5);
-			const p5Window = codex.primaryWindowMinutes === 300 ? "5hr" : `${codex.primaryWindowMinutes / 60}h`;
-			const p5Reset = codex.primaryResetAt > 0
-				? ` resets ${formatResetTime(codex.primaryResetAt)}`
-				: codex.primaryResetAfterSeconds > 0
-					? ` resets in ${formatDuration(codex.primaryResetAfterSeconds)}`
-					: "";
-
-			// Weekly window
-			const pW = codex.secondaryUsedPercent;
-			const pWColor = usageColor(pW);
-			const pWBar = progressBar(pW);
-			const pWReset = codex.secondaryResetAt > 0
-				? ` resets ${formatResetTime(codex.secondaryResetAt)}`
-				: codex.secondaryResetAfterSeconds > 0
-					? ` resets in ${formatDuration(codex.secondaryResetAfterSeconds)}`
-					: "";
-
-			lines.push(theme.fg("dim", sep.repeat(40)));
-			lines.push(`${theme.fg("accent", "Codex")}${theme.fg("dim", planLabel + limitLabel)}`);
-			lines.push(
-				`  ${p5Window}  ${theme.fg(p5Color, p5Bar)} ${theme.fg(p5Color, `${p5.toFixed(0)}%`)}${theme.fg("dim", p5Reset)}`,
-			);
-			lines.push(
-				`  week  ${theme.fg(pWColor, pWBar)} ${theme.fg(pWColor, `${pW.toFixed(0)}%`)}${theme.fg("dim", pWReset)}`,
-			);
-			if (codex.codeReviewUsedPercent !== undefined) {
-				const pC = codex.codeReviewUsedPercent;
-				const pCColor = usageColor(pC);
-				const pCBar = progressBar(pC);
-				const pCReset = codex.codeReviewResetAt
-					? ` resets ${formatResetTime(codex.codeReviewResetAt)}`
-					: codex.codeReviewResetAfterSeconds
-						? ` resets in ${formatDuration(codex.codeReviewResetAfterSeconds)}`
-						: "";
-				lines.push(
-					`  review ${theme.fg(pCColor, pCBar)} ${theme.fg(pCColor, `${pC.toFixed(0)}%`)}${theme.fg("dim", pCReset)}`,
-				);
-			}
-
-			// Credits info
-			if (codex.creditsHasCredits && codex.creditsBalance) {
-				lines.push(`  ${theme.fg("dim", `credits: ${codex.creditsBalance}`)}`);
-			}
-			if (codex.primaryOverSecondaryLimitPercent > 0) {
-				lines.push(`  ${theme.fg("warning", `⚠ 5hr exceeds weekly allocation: ${codex.primaryOverSecondaryLimitPercent}%`)}`);
-			}
-		}
-	} else {
-		lines.push(theme.fg("dim", sep.repeat(40)));
-		lines.push(theme.fg("dim", "Codex — not configured"));
-	}
 
 	// ── OpenCode Go ──
 	if (go) {
@@ -1208,31 +762,19 @@ function goFooterSummary(go: OpenCodeGoUsage): string {
 	return quotaParts.length > 0 ? quotaParts.join("/") : statusIcon(go.status);
 }
 
-function updateFooterStatus(ctx: any, codex: CodexUsage | undefined, go: OpenCodeGoUsage | undefined): void {
+function updateFooterStatus(ctx: any, go: OpenCodeGoUsage | undefined): void {
 	if (!ctx.hasUI) return;
 
-	const parts: string[] = [];
-	if (codexUsageHasData(codex)) {
-		parts.push(`Codex:${codex!.primaryUsedPercent.toFixed(0)}%/${codex!.secondaryUsedPercent.toFixed(0)}%`);
-	}
 	if (go) {
-		parts.push(`Go:${goFooterSummary(go)}`);
-	}
-	if (parts.length > 0) {
-		ctx.ui.setStatus("pi-usage", `⚡ ${parts.join(" │ ")}`);
+		ctx.ui.setStatus("pi-usage", `⚡ Go:${goFooterSummary(go)}`);
 	} else {
 		ctx.ui.setStatus("pi-usage", undefined);
 	}
 }
 
-function codexUsageHasData(codex: CodexUsage | undefined): codex is CodexUsage & { error: undefined } {
-	return codex !== undefined && codex.error === undefined && codex.activeLimit !== "error";
-}
-
 // ───────── Extension ─────────
 
 export default function (pi: ExtensionAPI) {
-	let codexUsage: CodexUsage | undefined;
 	let goUsage: OpenCodeGoUsage | undefined;
 	let isLoading = false;
 	let refreshTimer: ReturnType<typeof setInterval> | undefined;
@@ -1261,19 +803,7 @@ export default function (pi: ExtensionAPI) {
 		// Show loading state
 		if (ctx.hasUI) {
 			ctx.ui.setWidget(WIDGET_ID, (_tui: any, theme: any) =>
-				buildUsageWidget(codexUsage, goUsage, theme, true),
-			);
-		}
-
-		const checks: Promise<void>[] = [];
-
-		// Check Codex
-		const codexAuth = await getCodexToken();
-		if (codexAuth) {
-			checks.push(
-				checkCodexUsage(codexAuth.token, codexAuth.accountId).then((result) => {
-					codexUsage = result;
-				}),
+				buildUsageWidget(goUsage, theme, true),
 			);
 		}
 
@@ -1281,44 +811,32 @@ export default function (pi: ExtensionAPI) {
 		const goKey = getOpenCodeApiKey();
 		const goQuotaState = getOpenCodeGoQuotaConfig();
 		if (goKey || goQuotaState.config || goQuotaState.error) {
-			checks.push(
-				checkOpenCodeGoUsage(goKey, goQuotaState).then((result) => {
-					goUsage = result;
-				}),
-			);
+			try {
+				goUsage = await checkOpenCodeGoUsage(goKey, goQuotaState);
+			} catch {
+				goUsage = undefined;
+			}
 		} else {
 			goUsage = undefined;
 		}
-
-		// Run checks in parallel
-		await Promise.allSettled(checks);
 
 		isLoading = false;
 
 		// Update widget with results
 		if (ctx.hasUI) {
 			ctx.ui.setWidget(WIDGET_ID, (_tui: any, theme: any) =>
-				buildUsageWidget(codexUsage, goUsage, theme, false),
+				buildUsageWidget(goUsage, theme, false),
 			);
 
 			// Auto-dismiss widget after timeout (0 = keep forever)
 			scheduleDismiss();
 
 			// Footer status
-			updateFooterStatus(ctx, codexUsage, goUsage);
+			updateFooterStatus(ctx, goUsage);
 
 			// Quick notification
-			const parts: string[] = [];
-			if (codexUsageHasData(codexUsage)) {
-				parts.push(`Codex 5hr:${codexUsage!.primaryUsedPercent.toFixed(0)}% week:${codexUsage!.secondaryUsedPercent.toFixed(0)}%`);
-			} else if (codexUsage?.error) {
-				parts.push(`Codex: ✗ ${codexUsage.error.substring(0, 30)}`);
-			}
 			if (goUsage) {
-				parts.push(`Go:${goFooterSummary(goUsage)}`);
-			}
-			if (parts.length > 0) {
-				ctx.ui.notify(`⚡ ${parts.join(" │ ")}`, "info");
+				ctx.ui.notify(`⚡ Go:${goFooterSummary(goUsage)}`, "info");
 			}
 		}
 	}
@@ -1352,7 +870,7 @@ export default function (pi: ExtensionAPI) {
 
 	// ── /usage command ──
 	pi.registerCommand("usage", {
-		description: "Refresh and show Codex & OpenCode Go usage limits",
+		description: "Refresh and show OpenCode Go usage limits",
 		handler: async (_args, ctx) => {
 			await refreshUsage(ctx);
 		},
