@@ -43,6 +43,8 @@ interface CodexUsage {
 	creditsBalance: string;
 	creditsUnlimited: boolean;
 	source?: "usage_api" | "probe";
+	accountId?: string;
+	sourceKey?: string;
 	error?: string;
 }
 
@@ -63,7 +65,7 @@ interface CodexOAuthCredential {
 }
 
 type AuthJson = Record<string, AuthApiKeyCredential | CodexOAuthCredential | undefined>;
-type OpenAIOAuthSourceKey = (typeof OPENAI_OAUTH_SOURCE_KEYS)[number];
+type OpenAIOAuthSourceKey = string;
 
 interface GoCheckModel {
 	id: string;
@@ -134,6 +136,8 @@ const CHECK_TIMEOUT_MS = 15_000;
 const AUTO_REFRESH_MINUTES = parseEnvInt("PI_USAGE_REFRESH_MIN", 30);
 const CODEX_REFRESH_SKEW_MS = 60_000;
 const CODEX_PROBE_MODEL = "gpt-5.4-mini";
+const USAGE_REFRESH_AFTER_RESPONSE_DEBOUNCE_MS = 2_000;
+const USAGE_REFRESH_AFTER_RESPONSE_MIN_INTERVAL_MS = 10_000;
 const OPENAI_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
 const OPENCODE_GO_QUOTA_CONFIG_FILE = path.join("opencode-quota", "opencode-go.json");
 const OPENCODE_GO_DASHBOARD_URL_PREFIX = "https://opencode.ai/workspace";
@@ -164,6 +168,21 @@ function parseEnvInt(name: string, fallback: number): number {
 
 function authJsonPath(): string {
 	return path.join(os.homedir(), ".pi/agent/auth.json");
+}
+
+function settingsJsonPath(): string {
+	return path.join(os.homedir(), ".pi/agent/settings.json");
+}
+
+function readDefaultProvider(): string | undefined {
+	try {
+		const settingsPath = settingsJsonPath();
+		if (!fs.existsSync(settingsPath)) return undefined;
+		const parsed = JSON.parse(fs.readFileSync(settingsPath, "utf8")) as { defaultProvider?: unknown };
+		return typeof parsed.defaultProvider === "string" ? parsed.defaultProvider.trim() || undefined : undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 function readAuthJson(): AuthJson | undefined {
@@ -284,14 +303,23 @@ function resolveConfigValue(config: string): string | undefined {
 	return process.env[config] || config;
 }
 
-async function getCodexToken(): Promise<{ token: string; accountId: string; sourceKey: OpenAIOAuthSourceKey } | undefined> {
+function getPreferredCodexSourceKeys(ctx: any): string[] {
+	const preferred: string[] = [];
+	const modelProvider = typeof ctx?.model?.provider === "string" ? ctx.model.provider.trim() : "";
+	if (modelProvider) preferred.push(modelProvider);
+	const defaultProvider = readDefaultProvider();
+	if (defaultProvider) preferred.push(defaultProvider);
+	return dedupe(preferred);
+}
+
+async function getCodexToken(preferredSourceKeys: string[] = []): Promise<{ token: string; accountId: string; sourceKey: OpenAIOAuthSourceKey } | undefined> {
 	try {
 		const auth = readAuthJson();
 		if (!auth) return undefined;
 
 		let sourceKey: OpenAIOAuthSourceKey | undefined;
 		let codex: CodexOAuthCredential | undefined;
-		for (const key of OPENAI_OAUTH_SOURCE_KEYS) {
+		for (const key of dedupe([...preferredSourceKeys, ...OPENAI_OAUTH_SOURCE_KEYS])) {
 			const candidate = auth[key] as CodexOAuthCredential | undefined;
 			if (candidate?.type === "oauth" && candidate.access) {
 				sourceKey = key;
@@ -1056,6 +1084,12 @@ function buildUsageWidget(
 				? ` [${codex.activeLimit}]`
 				: "";
 
+			const accountLabel = codex.sourceKey
+				? ` · ${codex.sourceKey}${codex.accountId ? ` · …${codex.accountId.slice(-4)}` : ""}`
+				: codex.accountId
+					? ` · …${codex.accountId.slice(-4)}`
+					: "";
+
 			// 5hr window
 			const p5 = codex.primaryUsedPercent;
 			const p5Color = usageColor(p5);
@@ -1078,7 +1112,7 @@ function buildUsageWidget(
 					: "";
 
 			lines.push(theme.fg("dim", sep.repeat(40)));
-			lines.push(`${theme.fg("accent", "Codex")}${theme.fg("dim", planLabel + limitLabel)}`);
+			lines.push(`${theme.fg("accent", "Codex")}${theme.fg("dim", planLabel + limitLabel + accountLabel)}`);
 			lines.push(
 				`  ${p5Window}  ${theme.fg(p5Color, p5Bar)} ${theme.fg(p5Color, `${p5.toFixed(0)}%`)}${theme.fg("dim", p5Reset)}`,
 			);
@@ -1212,7 +1246,19 @@ function updateFooterStatus(ctx: any, codex: CodexUsage | undefined, go: OpenCod
 
 	const parts: string[] = [];
 	if (codexUsageHasData(codex)) {
-		parts.push(`Codex:${codex!.primaryUsedPercent.toFixed(0)}%/${codex!.secondaryUsedPercent.toFixed(0)}%`);
+		const c = codex!;
+		const p5Window = c.primaryWindowMinutes === 300 ? "5hr" : `${c.primaryWindowMinutes / 60}h`;
+		const p5Reset = c.primaryResetAt > 0
+			? ` reset ${formatResetTime(c.primaryResetAt)}`
+			: c.primaryResetAfterSeconds > 0
+				? ` reset ${formatDuration(c.primaryResetAfterSeconds)}`
+				: "";
+		const weekReset = c.secondaryResetAt > 0
+			? ` reset ${formatResetTime(c.secondaryResetAt)}`
+			: c.secondaryResetAfterSeconds > 0
+				? ` reset ${formatDuration(c.secondaryResetAfterSeconds)}`
+				: "";
+		parts.push(`Codex ${p5Window}:${c.primaryUsedPercent.toFixed(0)}%${p5Reset} week:${c.secondaryUsedPercent.toFixed(0)}%${weekReset}`);
 	}
 	if (go) {
 		parts.push(`Go:${goFooterSummary(go)}`);
@@ -1235,6 +1281,8 @@ export default function (pi: ExtensionAPI) {
 	let goUsage: OpenCodeGoUsage | undefined;
 	let isLoading = false;
 	let refreshTimer: ReturnType<typeof setInterval> | undefined;
+	let responseRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+	let lastResponseRefreshAt = 0;
 	let currentCtx: any;
 
 	async function refreshUsage(ctx: any): Promise<void> {
@@ -1251,14 +1299,21 @@ export default function (pi: ExtensionAPI) {
 
 		const checks: Promise<void>[] = [];
 
-		// Check Codex
-		const codexAuth = await getCodexToken();
+		// Check Codex. Prefer the active/default provider key so usage follows account-pool rotation
+		// (for example openai-codex-5) instead of sticking to the legacy openai-codex auth entry.
+		const codexAuth = await getCodexToken(getPreferredCodexSourceKeys(ctx));
 		if (codexAuth) {
 			checks.push(
 				checkCodexUsage(codexAuth.token, codexAuth.accountId).then((result) => {
-					codexUsage = result;
+					codexUsage = {
+						...result,
+						accountId: codexAuth.accountId,
+						sourceKey: codexAuth.sourceKey,
+					};
 				}),
 			);
+		} else {
+			codexUsage = undefined;
 		}
 
 		// Check OpenCode Go
@@ -1325,6 +1380,28 @@ export default function (pi: ExtensionAPI) {
 			clearInterval(refreshTimer);
 			refreshTimer = undefined;
 		}
+		if (responseRefreshTimer) {
+			clearTimeout(responseRefreshTimer);
+			responseRefreshTimer = undefined;
+		}
+	});
+
+	pi.on("model_select" as any, async (_event: any, ctx: any) => {
+		refreshUsage(ctx).catch(() => {});
+	});
+
+	pi.on("after_provider_response" as any, async (_event: any, ctx: any) => {
+		const provider = typeof ctx?.model?.provider === "string" ? ctx.model.provider.toLowerCase() : "";
+		if (!provider.includes("codex")) return;
+		currentCtx = ctx;
+		if (responseRefreshTimer) clearTimeout(responseRefreshTimer);
+		responseRefreshTimer = setTimeout(() => {
+			responseRefreshTimer = undefined;
+			const now = Date.now();
+			if (now - lastResponseRefreshAt < USAGE_REFRESH_AFTER_RESPONSE_MIN_INTERVAL_MS) return;
+			lastResponseRefreshAt = now;
+			if (currentCtx) refreshUsage(currentCtx).catch(() => {});
+		}, USAGE_REFRESH_AFTER_RESPONSE_DEBOUNCE_MS);
 	});
 
 	// ── /usage command ──
